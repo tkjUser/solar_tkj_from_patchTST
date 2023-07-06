@@ -99,6 +99,18 @@ def visual(true, preds=None, name='./pic/test.pdf'):
     plt.legend()
     plt.savefig(name, bbox_inches='tight')
 
+
+def plot_loss(train_loss, vali_loss, name='./pic/test.pdf'):
+    """
+    自己写的训练集和验证集损失的可视化
+    """
+    plt.figure()
+    plt.plot(train_loss, label='train_loss', linewidth=2)
+    plt.plot(vali_loss, label='Prediction', linewidth=2)
+    plt.legend()
+    plt.savefig(name, bbox_inches='tight')
+
+
 def test_params_flop(model,x_shape):
     """ 貌似是计算每个模型的计算速度（每秒一个浮点运算）
     If you want to test former's flop, you need to give default value to inputs in model.forward(), the following code can only pass one argument to forward()

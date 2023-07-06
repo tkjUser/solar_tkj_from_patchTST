@@ -1,7 +1,8 @@
 from data_provider.data_factory import data_provider
 from .exp_basic import Exp_Basic
-from models import Informer, Autoformer, Transformer, DLinear, Linear, NLinear, PatchTST, FFTransformer
-from utils.tools import EarlyStopping, adjust_learning_rate, visual, test_params_flop
+from models import Informer, Autoformer, Transformer, DLinear, Linear, NLinear, PatchTST, FFTransformer, LSTM, \
+    persistence, FEDformer
+from utils.tools import EarlyStopping, adjust_learning_rate, visual, test_params_flop, plot_loss
 from utils.metrics import metric
 
 import torch
@@ -17,7 +18,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 warnings.filterwarnings('ignore')
-
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'      # 添加这个定位问题  参考： https://blog.csdn.net/qq_38308388/article/details/131046609
 
 class Exp_Main(Exp_Basic):
     def __init__(self, args):
@@ -25,17 +26,21 @@ class Exp_Main(Exp_Basic):
         # 而其父类初始化时调用了_build_model()方法，该方法被当前类重写了，因此执行的还是当前类的 _build_model() 方法
 
     def _build_model(self):
-        model_dict = {
-            'Autoformer': Autoformer,
-            'Transformer': Transformer,
-            'Informer': Informer,
-            'DLinear': DLinear,
-            'NLinear': NLinear,
-            'Linear': Linear,
-            'PatchTST': PatchTST,
-            'FFTransformer': FFTransformer,
-        }
-        model = model_dict[self.args.model].Model(self.args).float()  # TODO:这里执行了当前model的初始化方法
+        # model_dict = {
+        #     'Autoformer': Autoformer,
+        #     'Transformer': Transformer,
+        #     'Informer': Informer,
+        #     'DLinear': DLinear,
+        #     'NLinear': NLinear,
+        #     'Linear': Linear,
+        #     'PatchTST': PatchTST,
+        #     'FFTransformer': FFTransformer,
+        #     'LSTM': LSTM,
+        #     'persistence': persistence,
+        #     'FEDformer': FEDformer,
+        # }
+        # model = model_dict[self.args.model].Model(self.args).float()  # TODO:这里执行了当前model的初始化方法
+        model = self.model_dict[self.args.model].Model(self.args).float()
 
         if self.args.use_multi_gpu and self.args.use_gpu:
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
@@ -106,6 +111,17 @@ class Exp_Main(Exp_Basic):
         vali_data, vali_loader = self._get_data(flag='val')
         test_data, test_loader = self._get_data(flag='test')
 
+        if 'persistence' in self.args.model:       # Check if the model is the persistence model
+            criterion = self._select_criterion()
+            vali_loss = self.vali(vali_data, vali_loader, criterion)
+            test_loss = self.vali(test_data, test_loader, criterion)
+
+            self.test(setting, test=0)  # 对于persistence模型不需要训练，也不需要加载模型，直接调用test()评估其性能即可
+
+            print('vali_loss: ', vali_loss)
+            print('test_loss: ', test_loss)
+            assert False              # 这个好像是用来结束程序的
+
         path = os.path.join(self.args.checkpoints, setting)
         if not os.path.exists(path):
             os.makedirs(path)
@@ -126,9 +142,11 @@ class Exp_Main(Exp_Basic):
                                             pct_start=self.args.pct_start,
                                             epochs=self.args.train_epochs,
                                             max_lr=self.args.learning_rate)
-
+        total_train_loss = []    # 把所有epoch的平均损失放到一个列表中，方便绘图
+        total_val_loss = []      # 把所有epoch的验证集损失放到一个列表中
         for epoch in range(self.args.train_epochs):  # 100
             iter_count = 0
+            teacher_forcing_ratio = 0.8    # For LSTM Enc-Dec training (not used for others).
             train_loss = []
 
             self.model.train()
@@ -170,9 +188,11 @@ class Exp_Main(Exp_Basic):
                         outputs = self.model(batch_x)  # 这里把当前长度的数据输入到PatchTST，调用PatchTST.py的forward训练模型
                     else:  # 编解码器的预测器输入有四个
                         if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                        else: # TODO: 其他模型的训练入口
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, batch_y)
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark,
+                                                 teacher_forcing_ratio=teacher_forcing_ratio)[0]
+                        else:  # TODO: 其他模型的训练入口
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark,             #  batch_y,
+                                                 teacher_forcing_ratio=teacher_forcing_ratio)  # TODO: 这里的 batch_y 不能乱输入，会与mask弄混
                     # print(outputs.shape,batch_y.shape)
                     f_dim = -1 if self.args.features == 'MS' else 0     # 0
                     outputs = outputs[:, -self.args.pred_len:, f_dim:]  # （32,96,321），对于多变量输入不变，单变量仅取最后一列
@@ -200,10 +220,19 @@ class Exp_Main(Exp_Basic):
                     adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=False)
                     scheduler.step()
 
+            # Reduce the teacher forcing ration every epoch
+            if self.args.model == 'LSTM':    # 仅针对LSTM模型的mixed_teacher_forcing
+                teacher_forcing_ratio -= 0.08
+                teacher_forcing_ratio = max(0., teacher_forcing_ratio)
+                print('teacher_forcing_ratio: ', teacher_forcing_ratio)
+
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
             vali_loss = self.vali(vali_data, vali_loader, criterion)  # TODO: 验证模型
             test_loss = self.vali(test_data, test_loader, criterion)  # 测试模型
+
+            total_train_loss.append(train_loss)  # 添加损失到列表
+            total_val_loss.append(vali_loss)     # 添加验证集损失
 
             print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
                 epoch + 1, train_steps, train_loss, vali_loss, test_loss))
@@ -217,6 +246,10 @@ class Exp_Main(Exp_Basic):
             else:
                 print('Updating learning rate to {}'.format(scheduler.get_last_lr()[0]))
 
+        # 绘制训练损失变化图
+        loss_path = './loss_plot/' + setting + '_loss.pdf'
+        plot_loss(total_train_loss, total_val_loss, loss_path)  # 在util里面创建个函数！
+
         best_model_path = path + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))
 
@@ -224,7 +257,6 @@ class Exp_Main(Exp_Basic):
 
     def test(self, setting, test=0):
         test_data, test_loader = self._get_data(flag='test')  # 读取测试集数据
-        # TODO： 测试集数据在划分数据集时已归一化，那么计算指标时计算的是归一化之前的还是之后的值？？？归一化之后的
         if test:
             print('loading model')
             self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth')))
@@ -239,10 +271,10 @@ class Exp_Main(Exp_Basic):
         self.model.eval()  # 设置验证模式
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
-                batch_x = batch_x.float().to(self.device)  # (32,336,321)
+                batch_x = batch_x.float().to(self.device)  # (32,96,321)
                 batch_y = batch_y.float().to(self.device)  # (32,144,321)
 
-                batch_x_mark = batch_x_mark.float().to(self.device)  # (32,336,4)
+                batch_x_mark = batch_x_mark.float().to(self.device)  # (32,96,4)
                 batch_y_mark = batch_y_mark.float().to(self.device)  # (32,144,4)
 
                 # decoder input     全零的(32,96,321) + batch_y的部分(32,48,321) ==> (32,144,321)  把batch_y的第二维度的
@@ -263,8 +295,10 @@ class Exp_Main(Exp_Basic):
                         outputs = self.model(batch_x)  # 使用训练好的模型输入测试集数据得到模型输出 (32,96,6)
                     else:
                         if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-
+                            outputs, atten_list = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                            # if not os.path.exists('./weights_plot/'+setting):           # 这里进行注意力图的可视化
+                            #     os.makedirs('./weights_plot/'+setting)
+                            # torch.save(atten_list, './weights_plot/'+setting+'/tensor_list.pth')
                         else:
                             outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 

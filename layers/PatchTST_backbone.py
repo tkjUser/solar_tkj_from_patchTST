@@ -82,8 +82,8 @@ class PatchTST_backbone(nn.Module):
         z = z.permute(0, 1, 3, 2)  # (32,321,16,42)                        # z: [bs x nvars x patch_len x patch_num]
 
         # model
-        # 对应论文图1(b)的橙黄色的”Transformer Encoder“部分
-        z = self.backbone(z)  # 执行 TSTiEncoder 的forward函数               # z: [bs x nvars x d_model x patch_num]
+        # 对应论文图1(b)的黄色的”Projection+Position Embedding“和橙黄色的”Transformer Encoder“部分
+        z = self.backbone(z)  # TODO: 执行 TSTiEncoder 的forward函数         # z: [bs x nvars x d_model x patch_num]
         # 对应论文图1(b)的绿色的”Flatten + Linear Head“      调用Flatten_Head类的forward方法
         z = self.head(z)      # z: [bs x nvars x target_window]  # (32,321,128,42) ==> (32,321,96)
 

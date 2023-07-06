@@ -1,36 +1,68 @@
-# 自己写的，普通的的LSTM，不使用编解码结构
 import torch
 import torch.nn as nn
+from layers.LSTM_EncDec import Encoder, Decoder
+from layers.Embed import DataEmbedding
+import random
 
 
 class Model(nn.Module):
     """
-        思想：
-        利用lstm后接的线性层实现使用过去多步预测未来多步（非编解码器，非自回归预测）
-        - 对于单变量输入，设置线性层的输出为多个实现多步预测；
-        - 对于多变量输入，设置线性层的输入为特征数时相当于多变量的单步预测（有待验证）；
-        - 对于多变量输入，设置线性层的输入为 特征数*预测步长 时相当于多变量的多步预测；
+    LSTM in Encoder-Decoder
     """
-
     def __init__(self, configs):
         super(Model, self).__init__()
-        self.seq_len = configs.seq_len          # 假如96
-        self.pred_len = configs.pred_len        # 假如48
-        self.input_size = configs.input_size    # 假如输入特征个数=6
-        self.hidden_size = configs.hidden_size  # LSTM隐藏层的单元个数128
-        self.num_layers = configs.num_layers            # 假如2
-        self.lstm = nn.LSTM(input_size=self.input_size, hidden_size=self.hidden_size,
-                            num_layers=self.num_layers)
-        self.linear = nn.Linear(self.hidden_size, self.pred_len * self.input_size)  # 这里就是把输出长度拉长为预测步长乘以特征数
-        # self.linear = nn.Linear(self.hidden_size, self.input_size)  # TODO:这里设置的两个参数分别是隐层数和输出个数
-        # Use this line if you want to visualize the weights
-        # self.Linear.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len,self.seq_len]))
+        self.d_model = configs.d_model
+        self.enc_layers = configs.e_layers
+        self.dec_layers = configs.d_layers
 
-    def forward(self, x):
-        # x: [Batch, Input length, Channel] ==> [Input length, Batch, Channel] ==> (seq_length,batch_size,hidden_size)
-        lstm_out, hidden = self.lstm(x.permute(1, 0, 2))  # 输入(32,96,48)  LSTM的输出lstm_out(96,32,128)
-        output = lstm_out[-1, :, :]   # 只取最后时刻的隐藏状态作为全连接的输入
-        # 全连接层输出预测值，并reshape为(batch_size, pred_len, input_size)的张量
-        output = self.linear(output).view(-1, self.pred_len, self.input_size)  # 全连接层输出预测值
+        self.train_strat_lstm = configs.train_strat_lstm
 
-        return output  # [Batch, Output length, Channel]
+        self.seq_len = configs.seq_len
+        self.pred_len = configs.pred_len
+        self.label_len = configs.label_len
+        self.output_size = configs.c_out
+        assert configs.label_len >= 1
+
+        self.enc_embedding = DataEmbedding(configs.enc_in, configs.d_model, configs.embed, configs.freq,
+                                           configs.dropout, pos_embed=False)
+        self.dec_embedding = DataEmbedding(configs.dec_in, configs.d_model, configs.embed, configs.freq,
+                                           configs.dropout, pos_embed=False)
+
+        self.encoder = Encoder(d_model=self.d_model, num_layers=self.enc_layers, dropout=configs.dropout)
+        self.decoder = Decoder(output_size=configs.c_out, d_model=self.d_model,
+                               dropout=configs.dropout, num_layers=self.dec_layers)
+
+    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, enc_self_mask=None, teacher_forcing_ratio=None, **_):
+        if self.train_strat_lstm == 'mixed_teacher_forcing' and self.training:
+            assert teacher_forcing_ratio is not None
+        # TODO: 目前看，至少recursive的LSTM是可以使用的！
+        target = x_dec[:, -self.pred_len:, -self.output_size:]  # (32,144,6) =选取后面的96步（全0掩码?）=> (32,96,6)  TODO: 这里的target可能是未来的值
+        enc_out = self.enc_embedding(x_enc, x_mark_enc)         # (32,96,6) =嵌入？把嵌入后的x和x_mark相加再次嵌入？？=> (32,96,512)
+
+        enc_out, enc_hid = self.encoder(enc_out)    # 输入到一个LSTM编码器层，输出运行结果和隐层状态
+
+        if self.enc_layers != self.dec_layers:      # 编码器层比解码器层多的时候
+            assert self.dec_layers <= self.enc_layers
+            enc_hid = [hid[-self.dec_layers:, ...] for hid in enc_hid]
+
+        dec_inp = x_dec[:, -(self.pred_len + 1), -self.output_size:]  # (32,144,6) =选取过去时间步的最后一行作为解码器的输入=> (32,6)
+        dec_hid = enc_hid                                             # 编码器的隐层
+
+        outputs = torch.zeros_like(target)                            # 全零的(32,96,6)
+
+        if not self.training or self.train_strat_lstm == 'recursive':  # 自回归输出
+            for t in range(self.pred_len):
+                dec_out, dec_hid = self.decoder(dec_inp, dec_hid)     # 输入前一个步长，得到后一个步长的预测值
+                outputs[:, t, :] = dec_out     # dec_out(32,6)  给outputs的第t个时间步赋予值，通过循环给outputs的每个值赋值
+                dec_inp = dec_out              # 预测值作为输入迭代获取新的值
+        else:
+            if self.train_strat_lstm == 'mixed_teacher_forcing':      # 混合学习
+                for t in range(self.pred_len):
+                    dec_out, dec_hid = self.decoder(dec_inp, dec_hid)
+                    outputs[:, t, :] = dec_out
+                    if random.random() < teacher_forcing_ratio:  # 一定几率的监督学习  TODO: 这里监督学习是把真实数据输入，但没有真实数据啊
+                        dec_inp = target[:, t, :]  # 使用未来真实值作为输入
+                    else:                                        # 自回归
+                        dec_inp = dec_out
+
+        return outputs  # [B, L, D]

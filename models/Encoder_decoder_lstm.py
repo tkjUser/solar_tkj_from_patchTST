@@ -1,4 +1,4 @@
-# 这个貌似是从FFTransformer里面复制过来的
+# 这个貌似不是从FFTransformer里面复制过来的
 import numpy as np
 import random
 import os, errno
